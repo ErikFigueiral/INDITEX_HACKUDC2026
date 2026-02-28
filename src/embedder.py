@@ -1,27 +1,63 @@
 import torch
-import torch.nn as nn
-import torchvision.models as models
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from .config import EMB_DIR
+from .model_builder import EmbeddingModel
+from .image_processing import download_image, preprocess_image
 
 
-class EmbeddingModel(nn.Module):
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def __init__(self, trainable=False):
-        super().__init__()
 
-        base = models.efficientnet_b0(weights="IMAGENET1K_V1")
+def generate_embeddings(df, id_col, url_col, limit=None):
 
-        self.features = base.features
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+    if limit:
+        df = df.head(limit)
 
-        if not trainable:
-            for p in self.features.parameters():
-                p.requires_grad = False
+    model = EmbeddingModel(trainable=False).to(device)
+    model.eval()
 
-    def forward(self, x):
+    embeddings = []
+    ids = []
 
-        x = self.features(x)
-        x = self.pool(x)
-        x = torch.flatten(x, 1)
-        x = nn.functional.normalize(x, dim=1)
+    plot_counter = 0
 
-        return x
+    with torch.no_grad():
+
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Embedding"):
+
+            try:
+                img = download_image(row[url_col])
+                tensor = preprocess_image(img).unsqueeze(0).to(device)
+
+                emb = model(tensor).cpu().numpy()[0]
+
+                embeddings.append(emb)
+                ids.append(row[id_col])
+
+                if plot_counter < 2:
+                    plt.figure(figsize=(10, 3))
+                    plt.plot(emb)
+                    plt.title(f"Embedding ID {row[id_col]}")
+                    plt.show()
+                    plot_counter += 1
+
+            except Exception as e:
+                print("Error:", e)
+                continue
+
+    if len(embeddings) == 0:
+        print("No embeddings generated.")
+        return None
+
+    embeddings = np.array(embeddings)
+    ids = np.array(ids)
+
+    np.save(f"{EMB_DIR}/embeddings.npy", embeddings)
+    np.save(f"{EMB_DIR}/ids.npy", ids)
+
+    print("Saved embeddings:", embeddings.shape)
+
+    return embeddings
