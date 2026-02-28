@@ -1,32 +1,27 @@
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torchvision.models as models
 
-IMG_SIZE = 224
 
+class EmbeddingModel(nn.Module):
 
-def build_embedding_model(trainable=False):
+    def __init__(self, trainable=False):
+        super().__init__()
 
-    base = tf.keras.applications.EfficientNetB0(
-        include_top=False,
-        weights="imagenet",
-        input_shape=(IMG_SIZE, IMG_SIZE, 3)
-    )
+        base = models.efficientnet_b0(weights="IMAGENET1K_V1")
 
-    # 🔥 Congelamos backbone
-    base.trainable = trainable
+        self.features = base.features
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
-    inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+        if not trainable:
+            for p in self.features.parameters():
+                p.requires_grad = False
 
-    x = tf.keras.applications.efficientnet.preprocess_input(inputs)
+    def forward(self, x):
 
-    # 🔥 SIN training=False
-    x = base(x)
+        x = self.features(x)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = nn.functional.normalize(x, dim=1)
 
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-
-    x = tf.keras.layers.Lambda(
-        lambda t: tf.math.l2_normalize(t, axis=1)
-    )(x)
-
-    model = tf.keras.Model(inputs, x)
-
-    return model
+        return x
