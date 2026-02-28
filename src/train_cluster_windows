@@ -1,0 +1,166 @@
+import os
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics.pairwise import cosine_similarity
+
+from .config import CLUSTER_DIR, MODEL_DIR, OUT_DIR
+from .model_builder import build_embedding_model, IMG_SIZE
+from .image_processing import download_image, pil_to_np, resize_to_square
+from .augment import build_augmentation
+from .region_embedding import generate_overlapping_windows, crop_windows, WindowCache
+
+def _l2(x, axis=-1, eps=1e-9):
+    return x / (np.linalg.norm(x, axis=axis, keepdims=True) + eps)
+
+def load_clusters():
+    path = os.path.join(CLUSTER_DIR, "clusters.csv")
+    return pd.read_csv(path)
+
+def build_siamese_train_step(embedding_model: tf.keras.Model):
+    """
+    Entrenamos para maximizar sim(model_window, product) para positivos.
+    Loss sencilla: 1 - cosine(sim)
+    (Para hackathon: simple y estable.)
+    """
+    opt = tf.keras.optimizers.Adam(1e-5)
+
+    @tf.function
+    def train_step(x_model, x_prod):
+        with tf.GradientTape() as tape:
+            e_m = embedding_model(x_model, training=True)
+            e_p = embedding_model(x_prod, training=True)
+            # cosine similarity
+            sim = tf.reduce_sum(e_m * e_p, axis=1)
+            loss = tf.reduce_mean(1.0 - sim)
+        grads = tape.gradient(loss, embedding_model.trainable_variables)
+        opt.apply_gradients(zip(grads, embedding_model.trainable_variables))
+        return loss, tf.reduce_mean(sim)
+
+    return train_step
+
+def _prep_tf(img_np_224: np.ndarray) -> np.ndarray:
+    # embedding_model ya hace preprocess_input dentro
+    return img_np_224.astype(np.float32)
+
+def train_with_windows_for_clusters(
+    product_df: pd.DataFrame,
+    bundle_train_csv: str,
+    *,
+    k_clusters: int = 15,
+    products_per_cluster: int = 200,
+    model_imgs_per_product: int = 50,
+    epochs: int = 2
+):
+    """
+    product_df: dataframe con product_asset_id, product_image_url
+    bundle_train_csv: path a bundle_product_train.csv
+    """
+    clusters = load_clusters()
+    bundle = pd.read_csv(bundle_train_csv)
+
+    # Esperado:
+    # bundle columns: model_image_url, product_asset_id
+    # si tu csv difiere, ajusta aquí:
+    if "model_image_url" not in bundle.columns or "product_asset_id" not in bundle.columns:
+        raise ValueError("bundle_train debe tener columnas: model_image_url, product_asset_id")
+
+    # Modelo base
+    embedding_model = build_embedding_model(trainable=False)
+
+    # Fine-tune suave: solo últimas capas
+    # (primero “calentamos” congelado 0 epochs -> aquí ya arrancamos suave)
+    for layer in embedding_model.layers[-30:]:
+        layer.trainable = True
+
+    aug = build_augmentation()
+    train_step = build_siamese_train_step(embedding_model)
+
+    # Cache de ventanas por model_image_url
+    cache = WindowCache(os.path.join(OUT_DIR, "window_cache.json"))
+
+    # Mapa producto -> url
+    prod_url = dict(zip(product_df["product_asset_id"], product_df["product_image_url"]))
+
+    # Entrenamiento por cluster (muestreo por cluster)
+    for c in range(k_clusters):
+        print(f"\n=== Cluster {c}/{k_clusters-1} ===")
+        prod_ids = clusters.loc[clusters["cluster"] == c, "product_asset_id"].astype(str).tolist()
+        if not prod_ids:
+            continue
+        prod_ids = prod_ids[:products_per_cluster]
+
+        for epoch in range(epochs):
+            print(f"  Epoch {epoch+1}/{epochs}")
+            np.random.shuffle(prod_ids)
+
+            for pid in prod_ids:
+                purl = prod_url.get(pid)
+                if not purl:
+                    continue
+
+                # Elegimos ejemplos de modelo donde aparece este producto
+                rows = bundle[bundle["product_asset_id"].astype(str) == str(pid)]
+                if rows.empty:
+                    continue
+                rows = rows.sample(min(len(rows), model_imgs_per_product), random_state=None)
+
+                # Descargar producto y preparar tensor
+                try:
+                    pimg = pil_to_np(download_image(purl))
+                    pimg = resize_to_square(pimg, IMG_SIZE)
+                except:
+                    continue
+
+                # (1,224,224,3) producto con augmentation también (ligera)
+                p_tf = aug(tf.convert_to_tensor(np.expand_dims(_prep_tf(pimg), 0)), training=True)
+
+                # Para cada model image: elegir best window por similitud rápida
+                for _, r in rows.iterrows():
+                    murl = r["model_image_url"]
+
+                    try:
+                        mimg = pil_to_np(download_image(murl))
+                    except:
+                        continue
+
+                    h, w, _ = mimg.shape
+                    wins = cache.get(murl)
+                    if wins is None:
+                        wins = generate_overlapping_windows(h, w, n_rows=4, n_cols=1, overlap=0.40)
+                        cache.set(murl, wins)
+
+                    crops = crop_windows(mimg, wins)
+
+                    # Preparamos lote de crops (N,224,224,3)
+                    crop_batch = []
+                    for cr in crops:
+                        try:
+                            cr = resize_to_square(cr, IMG_SIZE)
+                            crop_batch.append(_prep_tf(cr))
+                        except:
+                            pass
+                    if not crop_batch:
+                        continue
+
+                    crop_batch = np.stack(crop_batch, axis=0)
+                    crop_tf = tf.convert_to_tensor(crop_batch)
+                    crop_tf = aug(crop_tf, training=True)  # augmentation distinto cada iteración
+
+                    # Embeddings (sin gradiente) para escoger mejor ventana
+                    # (escogemos best window por similitud contra producto)
+                    e_crops = embedding_model(crop_tf, training=False).numpy()
+                    e_prod = embedding_model(p_tf, training=False).numpy()
+                    sims = (e_crops @ e_prod[0])
+                    best_idx = int(np.argmax(sims))
+
+                    # Entrenamos con esa ventana best
+                    x_model = tf.expand_dims(crop_tf[best_idx], 0)
+                    loss, sim = train_step(x_model, p_tf)
+                    # opcional: print ocasional
+            cache.save()
+
+    # Guardar modelo final
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    embedding_model.save(os.path.join(MODEL_DIR, "embedding_refined.keras"))
+    print("Saved refined embedding model:", os.path.join(MODEL_DIR, "embedding_refined.keras"))
