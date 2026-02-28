@@ -1,22 +1,31 @@
+import time
+import requests
 import numpy as np
-import keras
 import matplotlib.pyplot as plt
 from PIL import Image
 from io import BytesIO
+from torchvision import transforms
 
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0 Safari/537.36"
-    )
+    "User-Agent": "Mozilla/5.0"
 }
 
+IMG_SIZE = 224
 
-def download_image(url: str, retries: int = 3, timeout: int = 12):
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+def download_image(url, retries=3, timeout=12):
     last_err = None
-    for attempt in range(retries):
+    for _ in range(retries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
@@ -27,25 +36,11 @@ def download_image(url: str, retries: int = 3, timeout: int = 12):
     raise last_err
 
 
-def pil_to_np(img):
-    return np.asarray(img).astype(np.uint8)
+def preprocess_image(img):
+    return transform(img)
 
 
-def resize_to_square(img_np, size):
-    img = Image.fromarray(img_np)
-    img = img.resize((size, size), resample=Image.BILINEAR)
-    return np.asarray(img).astype(np.float32)
-
-
-def preprocess_image(img_np, size):
-    img = resize_to_square(img_np, size)
-    img = keras.applications.efficientnet.preprocess_input(img)
-    return img
-
-
-def plot_image(img_np, title=None):
-    plt.imshow(img_np.astype(np.uint8))
-    if title:
-        plt.title(title)
+def plot_image(img):
+    plt.imshow(img)
     plt.axis("off")
     plt.show()

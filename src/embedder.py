@@ -1,63 +1,27 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import tensorflow as tf
-
-from .config import EMB_DIR
-from .model_builder import build_embedding_model, IMG_SIZE
-from .image_processing import download_image, pil_to_np, resize_to_square
+import torch
+import torch.nn as nn
+import torchvision.models as models
 
 
-def generate_embeddings(df, id_col, url_col, limit=None):
+class EmbeddingModel(nn.Module):
 
-    if limit:
-        df = df.head(limit)
+    def __init__(self, trainable=False):
+        super().__init__()
 
-    model = build_embedding_model()
+        base = models.efficientnet_b0(weights="IMAGENET1K_V1")
 
-    embeddings = []
-    ids = []
+        self.features = base.features
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
-    plot_counter = 0
+        if not trainable:
+            for p in self.features.parameters():
+                p.requires_grad = False
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Embedding"):
+    def forward(self, x):
 
-        try:
-            img = download_image(row[url_col])
-            img = pil_to_np(img)
-            img = resize_to_square(img, IMG_SIZE)
+        x = self.features(x)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = nn.functional.normalize(x, dim=1)
 
-            # 🔥 preprocess correcto para EfficientNet
-            img = tf.keras.applications.efficientnet.preprocess_input(img)
-
-            arr = np.expand_dims(img, axis=0)
-            emb = model(arr, training=False).numpy()[0]
-
-            embeddings.append(emb)
-            ids.append(row[id_col])
-
-            # 🔥 Plot solo los 2 primeros embeddings
-            if plot_counter < 2:
-                plt.figure(figsize=(10, 3))
-                plt.plot(emb)
-                plt.title(f"Embedding for ID {row[id_col]}")
-                plt.show()
-                plot_counter += 1
-
-        except Exception as e:
-            print("Error:", e)
-            continue
-
-    if len(embeddings) == 0:
-        print("No embeddings generated.")
-        return None
-
-    embeddings = np.array(embeddings)
-    ids = np.array(ids)
-
-    np.save(f"{EMB_DIR}/embeddings.npy", embeddings)
-    np.save(f"{EMB_DIR}/ids.npy", ids)
-
-    print("Saved embeddings:", embeddings.shape)
-    return embeddings
+        return x
