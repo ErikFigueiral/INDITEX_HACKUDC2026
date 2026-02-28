@@ -3,7 +3,7 @@ import pandas as pd
 from tqdm import tqdm
 from .config import EMB_DIR
 from .model_builder import build_embedding_model, IMG_SIZE
-from .image_processing import download_image, preprocess_image
+from .image_processing import download_image, pil_to_np, resize_to_square
 
 def generate_embeddings(df, id_col, url_col, limit=None):
 
@@ -18,7 +18,8 @@ def generate_embeddings(df, id_col, url_col, limit=None):
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Embedding"):
         try:
             img = download_image(row[url_col])
-            img = preprocess_image(img, IMG_SIZE)
+            img = pil_to_np(img)
+            img = resize_to_square(img, IMG_SIZE)
 
             arr = np.expand_dims(img, axis=0)
             emb = model(arr, training=False).numpy()[0]
