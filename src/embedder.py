@@ -1,63 +1,79 @@
+import time
+import requests
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 import tensorflow as tf
+import matplotlib.pyplot as plt
+from PIL import Image
+from io import BytesIO
 
-from .config import EMB_DIR
-from .model_builder import build_embedding_model, IMG_SIZE
-from .image_processing import download_image, pil_to_np, resize_to_square
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+    "Connection": "keep-alive",
+}
 
 
-def generate_embeddings(df, id_col, url_col, limit=None):
+# ---------------------------------------------------
+# DOWNLOAD
+# ---------------------------------------------------
 
-    if limit:
-        df = df.head(limit)
-
-    model = build_embedding_model()
-
-    embeddings = []
-    ids = []
-
-    plot_counter = 0
-
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Embedding"):
-
+def download_image(url: str, retries: int = 3, timeout: int = 12) -> Image.Image:
+    last_err = None
+    for attempt in range(retries):
         try:
-            img = download_image(row[url_col])
-            img = pil_to_np(img)
-            img = resize_to_square(img, IMG_SIZE)
-
-            # 🔥 preprocess correcto para EfficientNet
-            img = tf.keras.applications.efficientnet.preprocess_input(img)
-
-            arr = np.expand_dims(img, axis=0)
-            emb = model(arr, training=False).numpy()[0]
-
-            embeddings.append(emb)
-            ids.append(row[id_col])
-
-            # 🔥 Plot solo los 2 primeros embeddings
-            if plot_counter < 2:
-                plt.figure(figsize=(10, 3))
-                plt.plot(emb)
-                plt.title(f"Embedding for ID {row[id_col]}")
-                plt.show()
-                plot_counter += 1
-
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            img = Image.open(BytesIO(r.content)).convert("RGB")
+            return img
         except Exception as e:
-            print("Error:", e)
-            continue
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.0 + attempt * 0.5)
+    raise last_err
 
-    if len(embeddings) == 0:
-        print("No embeddings generated.")
-        return None
 
-    embeddings = np.array(embeddings)
-    ids = np.array(ids)
+# ---------------------------------------------------
+# BASIC CONVERSIONS
+# ---------------------------------------------------
 
-    np.save(f"{EMB_DIR}/embeddings.npy", embeddings)
-    np.save(f"{EMB_DIR}/ids.npy", ids)
+def pil_to_np(img: Image.Image) -> np.ndarray:
+    return np.asarray(img).astype(np.uint8)
 
-    print("Saved embeddings:", embeddings.shape)
-    return embeddings
+
+def resize_to_square(img_np: np.ndarray, size: int) -> np.ndarray:
+    img = Image.fromarray(img_np)
+    img = img.resize((size, size), resample=Image.BILINEAR)
+    return np.asarray(img).astype(np.float32)
+
+
+# ---------------------------------------------------
+# PREPROCESS (STANDARD)
+# ---------------------------------------------------
+
+def preprocess_image(img_np: np.ndarray, size: int) -> np.ndarray:
+    """
+    Resize + EfficientNet preprocess.
+    Devuelve float32 listo para modelo.
+    """
+    img = resize_to_square(img_np, size)
+    img = tf.keras.applications.efficientnet.preprocess_input(img)
+    return img
+
+
+# ---------------------------------------------------
+# DEBUG PLOT
+# ---------------------------------------------------
+
+def plot_image(img_np: np.ndarray, title: str = None):
+    plt.figure(figsize=(4, 4))
+    plt.imshow(img_np.astype(np.uint8))
+    if title:
+        plt.title(title)
+    plt.axis("off")
+    plt.show()
